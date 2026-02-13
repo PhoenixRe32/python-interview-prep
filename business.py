@@ -54,6 +54,60 @@ class Order:
             country=data.get("country", "IE")
         )
 
+    @classmethod
+    def from_json(cls, order_json: str) -> Order:
+        try:
+            data = json.loads(order_json)
+        except json.JSONDecodeError as e:
+            raise ValueError("Invalid JSON") from e
+
+        if "id" not in data:
+            raise ValueError("Missing id")
+        if "items" not in data or not data["items"]:
+            raise ValueError("No items")
+        if "customer" not in data or "email" not in data["customer"]:
+            raise ValueError("Missing customer email")
+
+        return cls.from_dict(data)
+
+
+class PricingCalculator:
+    def calculate(self, order: Order, coupon: str | None = None) -> Decimal:
+        subtotal = sum((it.qty * it.unit_price for it in order.items), Decimal("0.0"))
+
+        shipping = Decimal("0.0")
+        if subtotal < Decimal("50"):
+            shipping = Decimal("7.99")
+        if order.country not in ("IE", "UK"):
+            shipping += Decimal("12.0")
+
+        tax_rate = Decimal("0.23") if order.country == "IE" else Decimal("0.2")
+        tax = (subtotal + shipping) * tax_rate
+
+        total = subtotal + shipping + tax
+
+        if order.customer.vip:
+            total *= Decimal("0.9")
+
+        if coupon:
+            total = self._apply_coupon(total, coupon)
+
+        total = total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return max(total, Decimal("0.0"))
+
+    def _apply_coupon(self, total: Decimal, coupon: str) -> Decimal:
+        if coupon == "SAVE10":
+            return total - Decimal("10")
+        if coupon == "HALF":
+            return total * Decimal("0.5")
+        if coupon.startswith("PCT"):
+            try:
+                pct = int(coupon[3:])
+                return total * (Decimal("100") - Decimal(pct)) / Decimal("100")
+            except ValueError:
+                pass
+        return total
+
 
 def process_order(order_json: str, coupon: str | None = None) -> dict[str, Any]:
     """
@@ -64,58 +118,13 @@ def process_order(order_json: str, coupon: str | None = None) -> dict[str, Any]:
     """
     # parse input
     try:
-        data = json.loads(order_json)
-    except json.JSONDecodeError:
-        return {"ok": False, "error": "Invalid JSON"}
+        order = Order.from_json(order_json)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
 
-    # basic validation (incomplete / inconsistent)
-    if "id" not in data:
-        return {"ok": False, "error": "Missing id"}
-    if "items" not in data or not data["items"]:
-        return {"ok": False, "error": "No items"}
-    if "customer" not in data or "email" not in data["customer"]:
-        return {"ok": False, "error": "Missing customer email"}
-
-    order = Order.from_dict(data)
-
-    # business logic: pricing + tax + discounts (all mixed in)
-    subtotal = Decimal("0.0")
-    for it in order.items:
-        subtotal += it.qty * it.unit_price
-
-    # shipping rules
-    shipping = Decimal("0.0")
-    if subtotal < Decimal("50"):
-        shipping = Decimal("7.99")
-    if order.country not in ("IE", "UK"):
-        shipping += Decimal("12.0")
-
-    # tax rules (hard-coded, simplistic)
-    tax_rate = Decimal("0.23") if order.country == "IE" else Decimal("0.2")
-    tax = (subtotal + shipping) * tax_rate
-
-    total = subtotal + shipping + tax
-
-    # discounts: VIP and coupon (weird interactions)
-    if order.customer.vip:
-        total *= Decimal("0.9")  # 10% off
-    if coupon:
-        if coupon == "SAVE10":
-            total -= Decimal("10")
-        elif coupon == "HALF":
-            total *= Decimal("0.5")
-        elif coupon.startswith("PCT"):
-            # PCT15 -> 15%
-            try:
-                pct = int(coupon[3:])
-                total *= (Decimal("100") - Decimal(pct)) / Decimal("100")
-            except ValueError:
-                pass
-
-    # round and ensure not negative
-    total = total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    if total < 0:
-        total = Decimal("0.0")
+    # business logic: pricing
+    calculator = PricingCalculator()
+    total = calculator.calculate(order, coupon)
 
     # persistence (SQLite) - env config mixed here
     db_path = os.getenv("ORDERS_DB", "orders.db")
