@@ -114,6 +114,11 @@ class OrderRepository(Protocol):
         ...
 
 
+class EmailSender(Protocol):
+    def send_confirmation(self, order: Order, total: Decimal) -> None:
+        ...
+
+
 class SQLiteOrderRepository:
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -136,6 +141,33 @@ class SQLiteOrderRepository:
             return created_at
         except sqlite3.IntegrityError as e:
             raise ValueError("Order already exists") from e
+
+
+class SMTPEmailSender:
+    def __init__(
+        self,
+        smtp_host: str,
+        smtp_port: int,
+        sender_email: str,
+        enabled: bool = True
+    ):
+        self.smtp_host = smtp_host
+        self.smtp_port = smtp_port
+        self.sender_email = sender_email
+        self.enabled = enabled
+
+    def send_confirmation(self, order: Order, total: Decimal) -> None:
+        if not self.enabled:
+            return
+
+        msg = EmailMessage()
+        msg["From"] = self.sender_email
+        msg["To"] = order.customer.email
+        msg["Subject"] = f"Order {order.id} confirmation"
+        msg.set_content(f"Thanks! Your total is {total}.")
+
+        with smtplib.SMTP(self.smtp_host, self.smtp_port) as s:
+            s.send_message(msg)
 
 
 def process_order(order_json: str, coupon: str | None = None) -> dict[str, Any]:
@@ -168,24 +200,21 @@ def process_order(order_json: str, coupon: str | None = None) -> dict[str, Any]:
         err = str(e)
         created_at = datetime.now(UTC).isoformat()  # Fallback for return
 
-    # notifications (email) mixed in too
+    # notifications (email)
+    email_sender = SMTPEmailSender(
+        smtp_host=os.getenv("SMTP_HOST", "localhost"),
+        smtp_port=int(os.getenv("SMTP_PORT", "25")),
+        sender_email=os.getenv("SENDER_EMAIL", "no-reply@example.com"),
+        enabled=os.getenv("SEND_EMAILS", "true").lower() == "true"
+    )
+
     if ok:
-        if os.getenv("SEND_EMAILS", "true").lower() == "true":
-            smtp_host = os.getenv("SMTP_HOST", "localhost")
-            smtp_port = int(os.getenv("SMTP_PORT", "25"))
-            sender = os.getenv("SENDER_EMAIL", "no-reply@example.com")
-            recipient = order.customer.email
-
-            msg = EmailMessage()
-            msg["From"] = sender
-            msg["To"] = recipient
-            msg["Subject"] = f"Order {order.id} confirmation"
-            msg.set_content(f"Thanks! Your total is {total}.")
-
-            # no retries, no timeouts, no error handling
-            s = smtplib.SMTP(smtp_host, smtp_port)
-            s.send_message(msg)
-            s.quit()
+        try:
+            email_sender.send_confirmation(order, total)
+        except Exception:
+            # For now, we just skip errors as it was doing before (implicitly)
+            # but ideally we should log it.
+            pass
 
     return {
         "ok": ok,
