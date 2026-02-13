@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, UTC
 from decimal import Decimal, ROUND_HALF_UP
 from email.message import EmailMessage
-from typing import Any
+from typing import Any, Protocol
 
 
 @dataclass(frozen=True)
@@ -109,6 +109,35 @@ class PricingCalculator:
         return total
 
 
+class OrderRepository(Protocol):
+    def save(self, order: Order, total: Decimal, original_json: str) -> str:
+        ...
+
+
+class SQLiteOrderRepository:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self) -> None:
+        with sqlite3.connect(self.db_path) as con:
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS orders (id TEXT PRIMARY KEY, payload TEXT, total REAL, created_at TEXT)"
+            )
+
+    def save(self, order: Order, total: Decimal, original_json: str) -> str:
+        created_at = datetime.now(UTC).isoformat()
+        try:
+            with sqlite3.connect(self.db_path) as con:
+                con.execute(
+                    "INSERT INTO orders (id, payload, total, created_at) VALUES (?, ?, ?, ?)",
+                    (order.id, original_json, float(total), created_at),
+                )
+            return created_at
+        except sqlite3.IntegrityError as e:
+            raise ValueError("Order already exists") from e
+
+
 def process_order(order_json: str, coupon: str | None = None) -> dict[str, Any]:
     """
     Takes JSON like:
@@ -126,30 +155,18 @@ def process_order(order_json: str, coupon: str | None = None) -> dict[str, Any]:
     calculator = PricingCalculator()
     total = calculator.calculate(order, coupon)
 
-    # persistence (SQLite) - env config mixed here
+    # persistence (SQLite)
     db_path = os.getenv("ORDERS_DB", "orders.db")
-    con = sqlite3.connect(db_path)
-    cur = con.cursor()
+    repo = SQLiteOrderRepository(db_path)
 
-    # schema management mixed in runtime path
-    cur.execute(
-        "CREATE TABLE IF NOT EXISTS orders (id TEXT PRIMARY KEY, payload TEXT, total REAL, created_at TEXT)"
-    )
-
-    created_at = datetime.now(UTC).isoformat()
     try:
-        cur.execute(
-            "INSERT INTO orders (id, payload, total, created_at) VALUES (?, ?, ?, ?)",
-            (order.id, order_json, float(total), created_at),
-        )
-        con.commit()
+        created_at = repo.save(order, total, order_json)
         ok = True
         err = None
-    except sqlite3.IntegrityError:
+    except ValueError as e:
         ok = False
-        err = "Order already exists"
-    finally:
-        con.close()
+        err = str(e)
+        created_at = datetime.now(UTC).isoformat()  # Fallback for return
 
     # notifications (email) mixed in too
     if ok:
