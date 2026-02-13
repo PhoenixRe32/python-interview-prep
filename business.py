@@ -170,37 +170,56 @@ class SMTPEmailSender:
             s.send_message(msg)
 
 
+class OrderService:
+    def __init__(
+        self,
+        calculator: PricingCalculator,
+        repository: OrderRepository,
+        email_sender: EmailSender
+    ):
+        self.calculator = calculator
+        self.repository = repository
+        self.email_sender = email_sender
+
+    def process(self, order_json: str, coupon: str | None = None) -> dict[str, Any]:
+        try:
+            order = Order.from_json(order_json)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+
+        total = self.calculator.calculate(order, coupon)
+
+        try:
+            created_at = self.repository.save(order, total, order_json)
+            ok = True
+            err = None
+        except ValueError as e:
+            ok = False
+            err = str(e)
+            created_at = datetime.now(UTC).isoformat()
+
+        if ok:
+            try:
+                self.email_sender.send_confirmation(order, total)
+            except Exception:
+                # Still skipping email errors as per original behavior
+                pass
+
+        return {
+            "ok": ok,
+            "order_id": order.id,
+            "total": float(total),
+            "created_at": created_at,
+            "error": err,
+        }
+
+
 def process_order(order_json: str, coupon: str | None = None) -> dict[str, Any]:
     """
-    Takes JSON like:
-      {"id":"o-123","customer":{"email":"a@b.com","vip":false},
-       "items":[{"sku":"ABC","qty":2,"unit_price":12.5},{"sku":"XYZ","qty":1,"unit_price":99.0}],
-       "country":"IE"}
+    Legacy entry point.
     """
-    # parse input
-    try:
-        order = Order.from_json(order_json)
-    except ValueError as e:
-        return {"ok": False, "error": str(e)}
-
-    # business logic: pricing
     calculator = PricingCalculator()
-    total = calculator.calculate(order, coupon)
-
-    # persistence (SQLite)
-    db_path = os.getenv("ORDERS_DB", "orders.db")
-    repo = SQLiteOrderRepository(db_path)
-
-    try:
-        created_at = repo.save(order, total, order_json)
-        ok = True
-        err = None
-    except ValueError as e:
-        ok = False
-        err = str(e)
-        created_at = datetime.now(UTC).isoformat()  # Fallback for return
-
-    # notifications (email)
+    repo = SQLiteOrderRepository(os.getenv("ORDERS_DB", "orders.db"))
     email_sender = SMTPEmailSender(
         smtp_host=os.getenv("SMTP_HOST", "localhost"),
         smtp_port=int(os.getenv("SMTP_PORT", "25")),
@@ -208,21 +227,8 @@ def process_order(order_json: str, coupon: str | None = None) -> dict[str, Any]:
         enabled=os.getenv("SEND_EMAILS", "true").lower() == "true"
     )
 
-    if ok:
-        try:
-            email_sender.send_confirmation(order, total)
-        except Exception:
-            # For now, we just skip errors as it was doing before (implicitly)
-            # but ideally we should log it.
-            pass
-
-    return {
-        "ok": ok,
-        "order_id": order.id,
-        "total": float(total),
-        "created_at": created_at,
-        "error": err,
-    }
+    service = OrderService(calculator, repo, email_sender)
+    return service.process(order_json, coupon)
 
 if __name__ == "__main__":
     example_order = """
