@@ -5,12 +5,57 @@ import json
 import os
 import smtplib
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, UTC
 from decimal import Decimal, ROUND_HALF_UP
 from email.message import EmailMessage
+from typing import Any
 
 
-def process_order(order_json: str, coupon: str | None = None) -> dict:
+@dataclass(frozen=True)
+class Customer:
+    email: str
+    vip: bool
+
+
+@dataclass(frozen=True)
+class OrderItem:
+    sku: str
+    qty: int
+    unit_price: Decimal
+
+
+@dataclass(frozen=True)
+class Order:
+    id: str
+    customer: Customer
+    items: list[OrderItem]
+    country: str
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Order:
+        customer_data = data["customer"]
+        customer = Customer(
+            email=customer_data["email"],
+            vip=customer_data.get("vip", False)
+        )
+        items = [
+            OrderItem(
+                sku=it["sku"],
+                qty=it["qty"],
+                unit_price=Decimal(str(it["unit_price"]))
+            )
+            for it in data["items"]
+        ]
+        return cls(
+            id=data["id"],
+            customer=customer,
+            items=items,
+            country=data.get("country", "IE")
+        )
+
+
+def process_order(order_json: str, coupon: str | None = None) -> dict[str, Any]:
     """
     Takes JSON like:
       {"id":"o-123","customer":{"email":"a@b.com","vip":false},
@@ -18,38 +63,41 @@ def process_order(order_json: str, coupon: str | None = None) -> dict:
        "country":"IE"}
     """
     # parse input
-    order = json.loads(order_json)
+    try:
+        data = json.loads(order_json)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "Invalid JSON"}
 
     # basic validation (incomplete / inconsistent)
-    if "id" not in order:
+    if "id" not in data:
         return {"ok": False, "error": "Missing id"}
-    if "items" not in order or not order["items"]:
+    if "items" not in data or not data["items"]:
         return {"ok": False, "error": "No items"}
-    if "customer" not in order or "email" not in order["customer"]:
+    if "customer" not in data or "email" not in data["customer"]:
         return {"ok": False, "error": "Missing customer email"}
+
+    order = Order.from_dict(data)
 
     # business logic: pricing + tax + discounts (all mixed in)
     subtotal = Decimal("0.0")
-    for it in order["items"]:
-        if "qty" not in it or "unit_price" not in it:
-            continue  # silently skip bad items
-        subtotal += Decimal(str(it["qty"])) * Decimal(str(it["unit_price"]))
+    for it in order.items:
+        subtotal += it.qty * it.unit_price
 
     # shipping rules
     shipping = Decimal("0.0")
     if subtotal < Decimal("50"):
         shipping = Decimal("7.99")
-    if order.get("country") not in ("IE", "UK"):
+    if order.country not in ("IE", "UK"):
         shipping += Decimal("12.0")
 
     # tax rules (hard-coded, simplistic)
-    tax_rate = Decimal("0.23") if order.get("country") == "IE" else Decimal("0.2")
+    tax_rate = Decimal("0.23") if order.country == "IE" else Decimal("0.2")
     tax = (subtotal + shipping) * tax_rate
 
     total = subtotal + shipping + tax
 
     # discounts: VIP and coupon (weird interactions)
-    if order["customer"].get("vip") is True:
+    if order.customer.vip:
         total *= Decimal("0.9")  # 10% off
     if coupon:
         if coupon == "SAVE10":
@@ -83,7 +131,7 @@ def process_order(order_json: str, coupon: str | None = None) -> dict:
     try:
         cur.execute(
             "INSERT INTO orders (id, payload, total, created_at) VALUES (?, ?, ?, ?)",
-            (order["id"], order_json, float(total), created_at),
+            (order.id, order_json, float(total), created_at),
         )
         con.commit()
         ok = True
@@ -100,12 +148,12 @@ def process_order(order_json: str, coupon: str | None = None) -> dict:
             smtp_host = os.getenv("SMTP_HOST", "localhost")
             smtp_port = int(os.getenv("SMTP_PORT", "25"))
             sender = os.getenv("SENDER_EMAIL", "no-reply@example.com")
-            recipient = order["customer"]["email"]
+            recipient = order.customer.email
 
             msg = EmailMessage()
             msg["From"] = sender
             msg["To"] = recipient
-            msg["Subject"] = f"Order {order['id']} confirmation"
+            msg["Subject"] = f"Order {order.id} confirmation"
             msg.set_content(f"Thanks! Your total is {total}.")
 
             # no retries, no timeouts, no error handling
@@ -115,7 +163,7 @@ def process_order(order_json: str, coupon: str | None = None) -> dict:
 
     return {
         "ok": ok,
-        "order_id": order["id"],
+        "order_id": order.id,
         "total": float(total),
         "created_at": created_at,
         "error": err,
