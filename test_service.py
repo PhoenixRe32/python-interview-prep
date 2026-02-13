@@ -1,7 +1,9 @@
 import unittest
 from decimal import Decimal
 from typing import Any
-from business import Order, Customer, OrderItem, OrderService, PricingCalculator
+from models import Order, Customer, OrderItem
+from pricing import PricingCalculator
+from service import OrderService
 
 class FakeOrderRepository:
     def __init__(self):

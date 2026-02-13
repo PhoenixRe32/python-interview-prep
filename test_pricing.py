@@ -1,6 +1,7 @@
 import unittest
 from decimal import Decimal
-from business import Order, Customer, OrderItem, PricingCalculator
+from models import Order, Customer, OrderItem
+from pricing import PricingCalculator
 
 class TestPricingCalculator(unittest.TestCase):
     def setUp(self):
