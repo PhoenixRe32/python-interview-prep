@@ -5,7 +5,8 @@ import json
 import os
 import smtplib
 import sqlite3
-from datetime import datetime
+from datetime import datetime, UTC
+from decimal import Decimal, ROUND_HALF_UP
 from email.message import EmailMessage
 
 
@@ -28,45 +29,45 @@ def process_order(order_json: str, coupon: str | None = None) -> dict:
         return {"ok": False, "error": "Missing customer email"}
 
     # business logic: pricing + tax + discounts (all mixed in)
-    subtotal = 0.0
+    subtotal = Decimal("0.0")
     for it in order["items"]:
         if "qty" not in it or "unit_price" not in it:
             continue  # silently skip bad items
-        subtotal += float(it["qty"]) * float(it["unit_price"])
+        subtotal += Decimal(str(it["qty"])) * Decimal(str(it["unit_price"]))
 
     # shipping rules
-    shipping = 0.0
-    if subtotal < 50:
-        shipping = 7.99
+    shipping = Decimal("0.0")
+    if subtotal < Decimal("50"):
+        shipping = Decimal("7.99")
     if order.get("country") not in ("IE", "UK"):
-        shipping += 12.0
+        shipping += Decimal("12.0")
 
     # tax rules (hard-coded, simplistic)
-    tax_rate = 0.23 if order.get("country") == "IE" else 0.2
+    tax_rate = Decimal("0.23") if order.get("country") == "IE" else Decimal("0.2")
     tax = (subtotal + shipping) * tax_rate
 
     total = subtotal + shipping + tax
 
     # discounts: VIP and coupon (weird interactions)
     if order["customer"].get("vip") is True:
-        total *= 0.9  # 10% off
+        total *= Decimal("0.9")  # 10% off
     if coupon:
         if coupon == "SAVE10":
-            total -= 10
+            total -= Decimal("10")
         elif coupon == "HALF":
-            total *= 0.5
+            total *= Decimal("0.5")
         elif coupon.startswith("PCT"):
             # PCT15 -> 15%
             try:
                 pct = int(coupon[3:])
-                total *= (100 - pct) / 100
+                total *= (Decimal("100") - Decimal(pct)) / Decimal("100")
             except ValueError:
                 pass
 
     # round and ensure not negative
-    total = round(total, 2)
+    total = total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     if total < 0:
-        total = 0.0
+        total = Decimal("0.0")
 
     # persistence (SQLite) - env config mixed here
     db_path = os.getenv("ORDERS_DB", "orders.db")
@@ -78,11 +79,11 @@ def process_order(order_json: str, coupon: str | None = None) -> dict:
         "CREATE TABLE IF NOT EXISTS orders (id TEXT PRIMARY KEY, payload TEXT, total REAL, created_at TEXT)"
     )
 
-    created_at = datetime.utcnow().isoformat()
+    created_at = datetime.now(UTC).isoformat()
     try:
         cur.execute(
             "INSERT INTO orders (id, payload, total, created_at) VALUES (?, ?, ?, ?)",
-            (order["id"], order_json, total, created_at),
+            (order["id"], order_json, float(total), created_at),
         )
         con.commit()
         ok = True
@@ -115,7 +116,7 @@ def process_order(order_json: str, coupon: str | None = None) -> dict:
     return {
         "ok": ok,
         "order_id": order["id"],
-        "total": total,
+        "total": float(total),
         "created_at": created_at,
         "error": err,
     }
